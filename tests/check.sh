@@ -30,6 +30,7 @@ jq -e --slurpfile old "$work/old" '.proxies[0].password==$old[0].auth.password a
 grep -Fq 'obfs-password=b%20%26%3F%3D' "$work/hy2.txt"
 if verify_binary "$work/new" "sha256:$(printf '%064d' 0)"; then echo 'wrong checksum accepted'; exit 1; fi
 bash hysteria.sh --help > "$work/file-help"
+# shellcheck disable=SC2002 # Exercise a real pipe, matching curl | bash.
 cat hysteria.sh | bash -s -- --help > "$work/pipe-help"
 cmp "$work/file-help" "$work/pipe-help"
 bash -s -- --help < hysteria.sh > "$work/stdin-help"
