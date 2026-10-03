@@ -29,7 +29,11 @@ export_client "$work/new" "$work"
 jq -e --slurpfile old "$work/old" '.proxies[0].password==$old[0].auth.password and .proxies[0]["skip-cert-verify"]==false and .proxies[0]["obfs-password"]==$old[0].obfs.salamander.password' "$work/clash.yaml" >/dev/null
 grep -Fq 'obfs-password=b%20%26%3F%3D' "$work/hy2.txt"
 if verify_binary "$work/new" "sha256:$(printf '%064d' 0)"; then echo 'wrong checksum accepted'; exit 1; fi
-bash hysteria.sh --help >/dev/null
+bash hysteria.sh --help > "$work/file-help"
+cat hysteria.sh | bash -s -- --help > "$work/pipe-help"
+cmp "$work/file-help" "$work/pipe-help"
+bash -s -- --help < hysteria.sh > "$work/stdin-help"
+cmp "$work/file-help" "$work/stdin-help"
 if bash hysteria.sh upgrade --domain hy.example.com --dry-run >/dev/null 2>&1; then exit 1; fi
 if bash hysteria.sh --domain bad --dry-run >/dev/null 2>&1; then exit 1; fi
 printf 'PASS configuration preservation, credential escaping, validation and checksum rejection\n'
