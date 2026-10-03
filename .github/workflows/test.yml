@@ -7,13 +7,12 @@ on:
 permissions:
   contents: read
 jobs:
-  test:
+  debian13:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - run: python3 scripts/build.py --check
+      - run: bash scripts/build.sh --check
       - run: bash -n install.sh dist/hysteria.sh
-      - run: python3 -m unittest discover -s tests -v
-      - name: Real core and systemd integration
-        run: sudo env HY2_DISPOSABLE_VM=yes python3 tests/linux_integration.py
+      - name: Debian 13 without Python
+        run: bash tests/run-linux.sh

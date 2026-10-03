@@ -1,6 +1,6 @@
 # HY2
 
-自用一键部署脚本。Debian 11+ / Ubuntu 22.04+，需要 root。
+自用 Bash 脚本，适配 Debian 13.x / systemd，需要 root。无需 Python；缺少的 `curl`、`jq`、证书包和 `iproute2` 会自动安装。
 
 ## 部署
 
@@ -41,8 +41,10 @@ journalctl -u hysteria-server -n 60 --no-pager
 修改 `src/` 或 `assets/` 后执行，生成的 `dist/hysteria.sh` 不直接编辑：
 
 ```bash
-python3 scripts/build.py
-python3 -m unittest discover -s tests -v
+bash scripts/build.sh
+bash tests/test.sh
 ```
+
+完整测试：在可丢弃的 Linux 测试虚拟机或 CI 中运行 `bash tests/run-linux.sh`（需要 Docker）。测试容器使用本地证书，不申请公共证书。
 
 核心：[Hysteria](https://github.com/HyNetworks/hysteria) · 原项目：[flame1ce/hysteria2-install](https://github.com/flame1ce/hysteria2-install)

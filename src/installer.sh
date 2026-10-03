@@ -321,37 +321,3 @@ main() {
     cat "$EXPORT/hy2.txt"
   fi
 }
-
-write_site() {
-  cat <<'HY2_ASSET'
-<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>松间 · 把日子过得慢一点</title><style>body{margin:0;background:#f5f3eb;color:#293e35;font:18px/1.9 system-ui}main{max-width:720px;margin:auto;padding:14vh 24px}small{letter-spacing:.2em}h1{font-size:clamp(36px,7vw,64px);line-height:1.2}article{margin:64px 0;border-top:1px solid #ccd2c8;padding-top:24px}footer{color:#69786c}</style><main><small>BETWEEN THE PINES · 松间</small><h1>把日子过得慢一点。</h1><p>记下一次散步、一本书，还有清晨的一束光。</p><article><h2>去树下走走</h2><p>不设目的地，沿着树荫慢慢走。风吹过叶子，细碎的声音让人重新留意身边的日常。</p></article><article><h2>留一点时间给阅读</h2><p>关掉提醒，翻开读到一半的书。不必急着读完，今天记住一句喜欢的话就很好。</p></article><footer>松间 · 日常记录</footer></main></html>
-HY2_ASSET
-}
-
-write_service() {
-  cat <<'HY2_ASSET'
-[Unit]
-Description=Hysteria 2 Server
-After=network-online.target
-Wants=network-online.target
-[Service]
-User=hysteria
-Group=hysteria
-WorkingDirectory=/var/lib/hysteria
-ExecStart=/usr/local/bin/hysteria server --config /etc/hysteria/config.yaml
-AmbientCapabilities=CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectHome=true
-ProtectSystem=strict
-ReadWritePaths=/var/lib/hysteria
-Restart=on-failure
-RestartSec=5
-[Install]
-WantedBy=multi-user.target
-
-HY2_ASSET
-}
-
-if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi
