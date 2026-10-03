@@ -7,7 +7,6 @@ UNIT=/etc/systemd/system/hysteria-server.service
 DATA=/var/lib/hysteria
 EXPORT=/etc/hysteria/client
 API=https://api.github.com/repos/HyNetworks/hysteria/releases
-DEFAULT_EMAIL=1094620146@qq.com
 
 fail() { printf '部署未完成：%s\n' "$*" >&2; exit 1; }
 usage() {
@@ -16,7 +15,7 @@ usage() {
 Debian 13.x / systemd。默认安装，已有配置时改为重新配置。
   --domain 域名          直接解析到本机
   --port 端口            新安装默认 443
-  --email 邮箱           默认 1094620146@qq.com
+  --email 邮箱           可选，新安装默认不填
   --masquerade-url URL   HTTPS 伪装网页
   --builtin-site         使用内置网页
   --version v2.x.x       安装/升级指定版本，默认最新稳定版
@@ -42,15 +41,15 @@ fetch() { curl --fail --silent --show-error --location --proto '=https' --proto-
 prepare_config() {
   local old=$1 output=$2 domain=$3 email=$4 port=$5 url=$6 builtin=$7 password
   password=$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')
-  jq --arg domain "$domain" --arg email "$email" --arg default_email "$DEFAULT_EMAIL" \
+  jq --arg domain "$domain" --arg email "$email" \
     --arg port "$port" --arg password "$password" --arg url "$url" --arg data "$DATA" --argjson builtin "$builtin" '
     del(.tls) |
     .listen = ((.listen // ":443" | sub(":[0-9]+$"; "")) + ":" + $port) |
     .auth = {type:"password", password:(.auth.password // $password)} |
     if .acme.domains == [$domain] then
       if $email != "" then .acme.email = $email else . end
-    else .acme = {domains:[$domain],email:(if $email == "" then $default_email else $email end),
-                  ca:"letsencrypt",type:"http",dir:($data+"/acme")} end |
+    else .acme = {domains:[$domain],ca:"letsencrypt",type:"http",dir:($data+"/acme")} |
+      if $email != "" then .acme.email = $email else . end end |
     if $url != "" then .masquerade = {type:"proxy",proxy:{url:$url,rewriteHost:true}}
     elif $builtin or (.masquerade == null) then .masquerade = {type:"file",file:{dir:($data+"/www")}}
     else . end' "$old" > "$output"

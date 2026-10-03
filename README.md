@@ -10,7 +10,7 @@
 curl -fsSL https://raw.githubusercontent.com/suiyuee/hysteria2-install/main/hysteria.sh -o hysteria.sh && sudo bash hysteria.sh
 ```
 
-只填域名。默认最新官方核心、UDP 443、随机密码、内置“松间”网页，证书邮箱 `1094620146@qq.com`。
+只填域名。默认最新官方核心、UDP 443、随机密码、内置“松间”网页。证书邮箱默认不填。
 
 完成后导入 `/etc/hysteria/client/clash.yaml`，或复制 `/etc/hysteria/client/hy2.txt` 中的链接。
 

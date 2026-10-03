@@ -13,7 +13,11 @@ done
 printf '{}\n' > "$work/old"
 prepare_config "$work/old" "$work/new" hy.example.com '' 443 '' false
 jq -e '.auth.password|length==64' "$work/new" >/dev/null
-jq -e '.acme.email=="1094620146@qq.com"' "$work/new" >/dev/null
+jq -e '.acme | has("email") | not' "$work/new" >/dev/null
+prepare_config "$work/old" "$work/explicit" hy.example.com user@example.com 443 '' false
+jq -e '.acme.email=="user@example.com"' "$work/explicit" >/dev/null
+prepare_config "$work/explicit" "$work/preserved" hy.example.com '' 443 '' false
+jq -e '.acme.email=="user@example.com"' "$work/preserved" >/dev/null
 prepare_config "$work/old" "$work/second" hy.example.com '' 443 '' false
 [[ $(jq -r .auth.password "$work/new") != "$(jq -r .auth.password "$work/second")" ]]
 jq '.auth.password="a:@/# ?\"\n汉字" | .listen=":63992" | .quic={maxIdleTimeout:"40s"} | .obfs={type:"salamander",salamander:{password:"b &?="}} | .acme.ca="zerossl" | .masquerade={type:"string",string:{content:"custom"}}' "$work/new" > "$work/old"
