@@ -7,7 +7,7 @@
 域名直接解析到服务器，关闭 CDN；放行 UDP 443、TCP 80（证书申请及续期）。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/suiyuee/hysteria2-install/main/dist/hysteria.sh -o hysteria.sh && sudo bash hysteria.sh
+curl -fsSL https://raw.githubusercontent.com/suiyuee/hysteria2-install/main/hysteria.sh -o hysteria.sh && sudo bash hysteria.sh
 ```
 
 只填域名。默认最新官方核心、UDP 443、随机密码、内置“松间”网页，证书邮箱 `1094620146@qq.com`。
@@ -38,13 +38,8 @@ journalctl -u hysteria-server -n 60 --no-pager
 
 ## 改代码
 
-修改 `src/` 或 `assets/` 后执行，生成的 `dist/hysteria.sh` 不直接编辑：
+直接修改 `hysteria.sh`，检查：`bash tests/check.sh`。
 
-```bash
-bash scripts/build.sh
-bash tests/test.sh
-```
-
-完整测试：在可丢弃的 Linux 测试虚拟机或 CI 中运行 `bash tests/run-linux.sh`（需要 Docker）。测试容器使用本地证书，不申请公共证书。
+完整测试：在可丢弃的 Linux 测试虚拟机或 CI 中运行 `bash tests/check.sh --container`（需要 Docker）。
 
 核心：[Hysteria](https://github.com/HyNetworks/hysteria) · 原项目：[flame1ce/hysteria2-install](https://github.com/flame1ce/hysteria2-install)

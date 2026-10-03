@@ -12,7 +12,6 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - run: bash scripts/build.sh --check
-      - run: bash -n install.sh dist/hysteria.sh
+      - run: bash -n hysteria.sh tests/check.sh
       - name: Debian 13 without Python
-        run: bash tests/run-linux.sh
+        run: bash tests/check.sh --container
