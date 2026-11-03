@@ -13,6 +13,12 @@ done
 printf '{}\n' > "$work/old"
 prepare_config "$work/old" "$work/new" hy.example.com '' 443 '' false
 jq -e '.auth.password|length==64' "$work/new" >/dev/null
+jq -e '.listen=="0.0.0.0:443" and .outbounds[0].direct.mode=="4"' "$work/new" >/dev/null
+# Migrate an old dual-stack listener without losing ACL outbound names or tuning.
+jq '.listen="[::]:443" | .outbounds=[{name:"existing",type:"direct",direct:{mode:"64",bindIPv6:"2001:db8::1",fastOpen:true}}]' "$work/new" > "$work/dual"
+prepare_config "$work/dual" "$work/ipv4" hy.example.com '' 443 '' false
+jq -e '.listen=="0.0.0.0:443" and .outbounds[0].name=="existing" and .outbounds[0].direct.mode=="4" and .outbounds[0].direct.fastOpen and (.outbounds[0].direct|has("bindIPv6")|not)' "$work/ipv4" >/dev/null
+
 jq -e '.acme | has("email") | not' "$work/new" >/dev/null
 prepare_config "$work/old" "$work/explicit" hy.example.com user@example.com 443 '' false
 jq -e '.acme.email=="user@example.com"' "$work/explicit" >/dev/null
@@ -28,6 +34,16 @@ done
 export_client "$work/new" "$work"
 jq -e --slurpfile old "$work/old" '.proxies[0].password==$old[0].auth.password and .proxies[0]["skip-cert-verify"]==false and .proxies[0]["obfs-password"]==$old[0].obfs.salamander.password' "$work/clash.yaml" >/dev/null
 grep -Fq 'obfs-password=b%20%26%3F%3D' "$work/hy2.txt"
+jq -e '.ipv6==false and .dns.ipv6==false and .proxies[0]["ip-version"]=="ipv4" and .proxies[0].name=="hy.example.com"' "$work/clash.yaml" >/dev/null
+# DNS must point only to local IPv4, including on a dual-stack host.
+(
+  ip() { printf '%s\n' '[{"addr_info":[{"scope":"global","family":"inet","local":"192.0.2.1"},{"scope":"global","family":"inet6","local":"2001:db8::1"}]}]'; }
+  getent() { printf '192.0.2.1 STREAM\n'; }
+  dns_check hy.example.com 0
+  getent() { printf '192.0.2.1 STREAM\n2001:db8::1 STREAM\n'; }
+  if (dns_check hy.example.com 0) >/dev/null 2>&1; then echo 'accepted AAAA record'; exit 1; fi
+)
+
 if verify_binary "$work/new" "sha256:$(printf '%064d' 0)"; then echo 'wrong checksum accepted'; exit 1; fi
 bash hysteria.sh --help > "$work/file-help"
 # shellcheck disable=SC2002 # Exercise a real pipe, matching curl | bash.

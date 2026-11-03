@@ -12,7 +12,7 @@ fail() { printf '部署未完成：%s\n' "$*" >&2; exit 1; }
 usage() {
   cat <<'HELP'
 用法：bash hysteria.sh [install|upgrade|reconfigure] [参数]
-Debian 13.x / systemd。默认安装，已有配置时改为重新配置。
+Debian 13.x / systemd，仅 IPv4。默认安装，已有配置时改为重新配置。
   --domain 域名          直接解析到本机
   --port 端口            新安装默认 443
   --email 邮箱           可选，新安装默认不填
@@ -36,7 +36,7 @@ valid_domain() {
   done
 }
 number() { [[ $1 =~ ^[0-9]{1,5}$ ]]; }
-fetch() { curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 180 --retry 2 "$@"; }
+fetch() { curl --ipv4 --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 180 --retry 2 "$@"; }
 
 prepare_config() {
   local old=$1 output=$2 domain=$3 email=$4 port=$5 url=$6 builtin=$7 password
@@ -44,7 +44,9 @@ prepare_config() {
   jq --arg domain "$domain" --arg email "$email" \
     --arg port "$port" --arg password "$password" --arg url "$url" --arg data "$DATA" --argjson builtin "$builtin" '
     del(.tls) |
-    .listen = ((.listen // ":443" | sub(":[0-9]+$"; "")) + ":" + $port) |
+    .listen = ("0.0.0.0:" + $port) |
+    .outbounds = ((if (.outbounds // [] | length) == 0 then [{name:"direct",type:"direct"}] else .outbounds end) |
+      map(if .type == "direct" then .direct.mode = "4" | del(.direct.bindIPv6) else . end)) |
     .auth = {type:"password", password:(.auth.password // $password)} |
     if .acme.domains == [$domain] then
       if $email != "" then .acme.email = $email else . end
@@ -59,9 +61,9 @@ export_client() {
   local config=$1 dest=$2
   jq '
     .acme.domains[0] as $d | (.listen | split(":") | last | tonumber) as $port |
-    ({name:$d,type:"hysteria2",server:$d,port:$port,password:.auth.password,sni:$d,"skip-cert-verify":false}
+    ({name:$d,type:"hysteria2",server:$d,port:$port,"ip-version":"ipv4",password:.auth.password,sni:$d,"skip-cert-verify":false}
       + (if .obfs.type == "salamander" then {obfs:"salamander","obfs-password":.obfs.salamander.password} else {} end)) as $node |
-    {"mixed-port":7890,"allow-lan":false,mode:"rule",proxies:[$node],
+    {"mixed-port":7890,"allow-lan":false,ipv6:false,dns:{ipv6:false},mode:"rule",proxies:[$node],
      "proxy-groups":[{name:"代理选择",type:"select",proxies:[$d,"DIRECT"]}],
      rules:["IP-CIDR,127.0.0.0/8,DIRECT","IP-CIDR,10.0.0.0/8,DIRECT","IP-CIDR,172.16.0.0/12,DIRECT","IP-CIDR,192.168.0.0/16,DIRECT","MATCH,代理选择"]}' "$config" > "$dest/clash.yaml"
   jq -r '.acme.domains[0] as $d |
@@ -92,7 +94,7 @@ download_binary() {
 
 dns_check() {
   local domain=$1 end=$((SECONDS + $2)) local_ips resolved ip good
-  local_ips=$(ip -j addr | jq -r '.[].addr_info[] | select(.scope=="global") | .local')
+  local_ips=$(ip -j addr | jq -r '.[].addr_info[] | select(.scope=="global" and .family=="inet") | .local')
   while :; do
     resolved=$(getent -A ahosts "$domain" | awk '{print $1}' | sort -u) || resolved=''
     good=true
@@ -101,7 +103,7 @@ dns_check() {
       grep -Fxq -- "$ip" <<< "$local_ips" || good=false
     done <<< "$resolved"
     if $good; then return; fi
-    (( SECONDS < end )) || fail "DNS 未就绪：$domain。请检查所有 A/AAAA 记录并关闭 CDN。"
+    (( SECONDS < end )) || fail "DNS 未就绪：$domain。请将 A 记录指向本机 IPv4，删除 AAAA 记录并关闭 CDN。"
     printf '等待 DNS 生效……\n'
     sleep 5
   done
@@ -278,7 +280,7 @@ main() {
   fi
   if [[ $action == reconfigure ]]; then cp "$BINARY" "$work/hysteria"; chmod 755 "$work/hysteria"
   else download_binary "$work/hysteria" "$version"; fi
-  jq '.listen=":0" | .masquerade={type:"string",string:{content:"setup"}}' "$work/config.json" > "$work/preview.json"
+  jq '.listen="0.0.0.0:0" | .masquerade={type:"string",string:{content:"setup"}}' "$work/config.json" > "$work/preview.json"
   chown hysteria:hysteria "$work/preview.json"
   stage="hy2-setup-${work##*/}"
   systemd-run --quiet --unit="$stage" --property=User=hysteria --property=Group=hysteria \

@@ -4,13 +4,13 @@
 
 ## 部署
 
-域名直接解析到服务器，关闭 CDN；放行 UDP 443、TCP 80（证书申请及续期）。
+仅使用 IPv4：域名 A 记录直接解析到服务器，删除 AAAA 记录，关闭 CDN；放行 UDP 443、TCP 80（证书申请及续期）。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/suiyuee/hysteria2-install/main/hysteria.sh -o hysteria.sh && sudo bash hysteria.sh
 ```
 
-只填域名。默认最新官方核心、UDP 443、随机密码、内置“松间”网页。证书邮箱默认不填。
+只填域名。默认最新官方核心、IPv4 UDP 443、随机密码、内置“松间”网页。服务端直连出口固定 IPv4，导出的 Clash 配置关闭 IPv6，节点名只用域名。证书邮箱默认不填。
 
 完成后导入 `/etc/hysteria/client/clash.yaml`，或复制 `/etc/hysteria/client/hy2.txt` 中的链接。
 
@@ -25,7 +25,7 @@ sudo bash hysteria.sh reconfigure --domain hy.example.com  # 改域名
 sudo bash hysteria.sh --help                          # 所有参数
 ```
 
-原系统重复执行保留配置。重装或换服务器后，改好域名解析再重新部署，客户端导入新节点；改域名或端口后也需更新客户端。
+原系统重复执行保留密码、证书和自定义设置，同时将 HY2 监听及直连出口改为 IPv4；不会修改系统 IPv6 开关或其它服务。`upgrade` 只升级核心，已有配置切换 IPv4 请运行 `reconfigure`。重装或换服务器后，改好域名解析再重新部署，客户端导入新节点；改域名或端口后也需更新客户端。
 
 ## 排错
 
