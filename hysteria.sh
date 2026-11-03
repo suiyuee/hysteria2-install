@@ -4,6 +4,9 @@ set -Eeuo pipefail
 CONFIG=/etc/hysteria/config.yaml
 BINARY=/usr/local/bin/hysteria
 UNIT=/etc/systemd/system/hysteria-server.service
+# 多 IPv4：第一个域名沿用上面的配置和服务，其余每个域名一个实例。
+NODES=/etc/hysteria/nodes
+TEMPLATE=/etc/systemd/system/hysteria-server@.service
 DATA=/var/lib/hysteria
 EXPORT=/etc/hysteria/client
 API=https://api.github.com/repos/HyNetworks/hysteria/releases
@@ -13,7 +16,10 @@ usage() {
   cat <<'HELP'
 用法：bash hysteria.sh [install|upgrade|reconfigure] [参数]
 Debian 13.x / systemd，仅 IPv4。默认安装，已有配置时改为重新配置。
-  --domain 域名          直接解析到本机
+多个域名即多个 IPv4 节点；重新配置时不在列表里的附加节点会被停用并删除配置。
+  --domain 域名          直接解析到本机；可重复或用逗号分隔。多个域名时
+                         每个域名的 A 记录指向本机一个不同的 IPv4，
+                         各自监听并从该 IP 出网
   --port 端口            新安装默认 443
   --email 邮箱           可选，新安装默认不填
   --masquerade-url URL   HTTPS 伪装网页
@@ -37,6 +43,10 @@ valid_domain() {
 }
 number() { [[ $1 =~ ^[0-9]{1,5}$ ]]; }
 fetch() { curl --ipv4 --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 180 --retry 2 "$@"; }
+contains() { local want=$1 item; shift; for item; do [[ $item == "$want" ]] && return 0; done; return 1; }
+local_ipv4s() { ip -j addr | jq -r '.[].addr_info[] | select(.scope=="global" and .family=="inet") | .local'; }
+# 附加节点：已有 *.yaml 的文件名即域名。
+extra_nodes() { local f; for f in "$NODES"/*.yaml; do [[ -e $f ]] && basename "$f" .yaml; done; return 0; }
 
 prepare_config() {
   local old=$1 output=$2 domain=$3 email=$4 port=$5 url=$6 builtin=$7 password
@@ -57,18 +67,28 @@ prepare_config() {
     else . end' "$old" > "$output"
 }
 
+# 多 IPv4 节点：监听、证书验证和直连出口都绑定这个 IP，各节点互不占用端口。
+node_config() {
+  local src=$1 output=$2 ip=$3
+  jq --arg ip "$ip" '
+    .listen = ($ip + ":" + (.listen | split(":") | last)) |
+    .acme.listenHost = $ip |
+    .outbounds |= map(if .type == "direct" then .direct.bindIPv4 = $ip | del(.direct.bindDevice) else . end)' "$src" > "$output"
+}
+
 export_client() {
-  local config=$1 dest=$2
-  jq '
-    .acme.domains[0] as $d | (.listen | split(":") | last | tonumber) as $port |
-    ({name:$d,type:"hysteria2",server:$d,port:$port,"ip-version":"ipv4",password:.auth.password,sni:$d,"skip-cert-verify":false}
-      + (if .obfs.type == "salamander" then {obfs:"salamander","obfs-password":.obfs.salamander.password} else {} end)) as $node |
-    {"mixed-port":7890,"allow-lan":false,ipv6:false,dns:{ipv6:false},mode:"rule",proxies:[$node],
-     "proxy-groups":[{name:"代理选择",type:"select",proxies:[$d,"DIRECT"]}],
-     rules:["IP-CIDR,127.0.0.0/8,DIRECT","IP-CIDR,10.0.0.0/8,DIRECT","IP-CIDR,172.16.0.0/12,DIRECT","IP-CIDR,192.168.0.0/16,DIRECT","MATCH,代理选择"]}' "$config" > "$dest/clash.yaml"
+  local dest=$1; shift
+  jq -s '
+    def node: .acme.domains[0] as $d | (.listen | split(":") | last | tonumber) as $port |
+      {name:$d,type:"hysteria2",server:$d,port:$port,"ip-version":"ipv4",password:.auth.password,sni:$d,"skip-cert-verify":false}
+      + (if .obfs.type == "salamander" then {obfs:"salamander","obfs-password":.obfs.salamander.password} else {} end);
+    map(node) as $nodes |
+    {"mixed-port":7890,"allow-lan":false,ipv6:false,dns:{ipv6:false},mode:"rule",proxies:$nodes,
+     "proxy-groups":[{name:"代理选择",type:"select",proxies:(($nodes | map(.name)) + ["DIRECT"])}],
+     rules:["IP-CIDR,127.0.0.0/8,DIRECT","IP-CIDR,10.0.0.0/8,DIRECT","IP-CIDR,172.16.0.0/12,DIRECT","IP-CIDR,192.168.0.0/16,DIRECT","MATCH,代理选择"]}' "$@" > "$dest/clash.yaml"
   jq -r '.acme.domains[0] as $d |
     "hysteria2://" + (.auth.password|@uri) + "@" + $d + ":" + (.listen|split(":")|last) + "/?sni=" + $d + "&insecure=0" +
-    (if .obfs.type == "salamander" then "&obfs=salamander&obfs-password=" + (.obfs.salamander.password|@uri) else "" end) + "#" + $d' "$config" > "$dest/hy2.txt"
+    (if .obfs.type == "salamander" then "&obfs=salamander&obfs-password=" + (.obfs.salamander.password|@uri) else "" end) + "#" + $d' "$@" > "$dest/hy2.txt"
 }
 
 verify_binary() {
@@ -92,23 +112,43 @@ download_binary() {
   printf '官方核心 %s 校验通过。\n' "$(jq -r '.tag_name' "$work/release.json")"
 }
 
+# 域名只解析到本机 IPv4；single=true 时只能有一条 A 记录，并输出该 IP。
 dns_check() {
-  local domain=$1 end=$((SECONDS + $2)) local_ips resolved ip good
-  local_ips=$(ip -j addr | jq -r '.[].addr_info[] | select(.scope=="global" and .family=="inet") | .local')
+  local domain=$1 end=$((SECONDS + $2)) single=${3:-false} local_ips resolved ip good
+  local_ips=$(local_ipv4s)
   while :; do
     resolved=$(getent -A ahosts "$domain" | awk '{print $1}' | sort -u) || resolved=''
     good=true
     [[ -n $resolved ]] || good=false
+    if [[ $single == true && $(grep -c . <<< "$resolved") != 1 ]]; then good=false; fi
     while IFS= read -r ip; do
       grep -Fxq -- "$ip" <<< "$local_ips" || good=false
     done <<< "$resolved"
-    if $good; then return; fi
-    (( SECONDS < end )) || fail "DNS 未就绪：$domain。请将 A 记录指向本机 IPv4，删除 AAAA 记录并关闭 CDN。"
-    printf '等待 DNS 生效……\n'
+    if $good; then
+      if [[ $single == true ]]; then printf '%s\n' "$resolved"; fi
+      return
+    fi
+    if (( SECONDS >= end )); then
+      if [[ $single == true ]]; then fail "DNS 未就绪：$domain。多节点时每个域名只能有一条 A 记录，指向本机的一个 IPv4；删除 AAAA 记录并关闭 CDN。"; fi
+      fail "DNS 未就绪：$domain。请将 A 记录指向本机 IPv4，删除 AAAA 记录并关闭 CDN。"
+    fi
+    printf '等待 DNS 生效……\n' >&2
     sleep 5
   done
 }
+# 用该 IP 发起一次外网请求，确认出口就是它自己；附加 IP 走了别的出口时需要先配置策略路由。
+egress_check() {
+  local ip=$1 seen
+  seen=$(fetch --interface "$ip" https://1.1.1.1/cdn-cgi/trace | sed -n 's/^ip=//p') || seen=''
+  [[ $seen == "$ip" ]] || fail "从 $ip 出网时对外显示为 ${seen:-（请求失败）}。请确认该 IP 已配置在网卡上，必要时为它配置策略路由。"
+}
 port_free() { [[ -z $(ss -H "-l${1}n" "sport = :$2") ]]; }
+# 端口只被本脚本的 hysteria 实例占用时，重新配置可以接管。
+port_held_by_hysteria() {
+  local lines
+  lines=$(ss -H -lunp "sport = :$1")
+  [[ -n $lines ]] && ! grep -vq 'users:(("hysteria"' <<< "$lines"
+}
 wait_ready() {
   local unit=$1 end=$((SECONDS + $2)) status pid state restarts stable=0 sockets
   while (( SECONDS < end )); do
@@ -129,8 +169,8 @@ wait_ready() {
 }
 
 rollback() {
-  local i path tmp failed=0
-  systemctl stop hysteria-server >/dev/null 2>&1 || failed=1
+  local i path tmp name failed=0
+  systemctl stop hysteria-server 'hysteria-server@*.service' >/dev/null 2>&1 || failed=1
   for ((i=${#targets[@]}-1; i>=0; i--)); do
     path=${targets[i]}
     if [[ ${existed[i]} == yes ]]; then
@@ -142,11 +182,20 @@ rollback() {
     systemctl disable hysteria-server >/dev/null 2>&1 || true
     rm -f /etc/systemd/system/multi-user.target.wants/hysteria-server.service || failed=1
   fi
+  # 附加节点恢复部署前的开机启动状态。
+  for name in "${touched_nodes[@]}"; do
+    if contains "$name" "${enabled_nodes[@]}"; then
+      ln -sf "$TEMPLATE" "/etc/systemd/system/multi-user.target.wants/hysteria-server@$name.service" || failed=1
+    else rm -f "/etc/systemd/system/multi-user.target.wants/hysteria-server@$name.service" || failed=1; fi
+  done
   systemctl daemon-reload || failed=1
-  systemctl reset-failed hysteria-server >/dev/null 2>&1 || true
+  systemctl reset-failed hysteria-server 'hysteria-server@*.service' >/dev/null 2>&1 || true
   if [[ $was_active == true ]]; then
     if systemctl restart hysteria-server && wait_ready hysteria-server 30; then :; else failed=1; fi
   fi
+  for name in "${active_nodes[@]}"; do
+    if systemctl restart "hysteria-server@$name" && wait_ready "hysteria-server@$name" 30; then :; else failed=1; fi
+  done
   if (( failed )); then printf '恢复未完全成功，请检查服务；备份：%s\n' "$backup" >&2
   else printf '已恢复部署前文件及服务状态；备份：%s\n' "$backup" >&2; fi
 }
@@ -178,10 +227,39 @@ replace_file() {
   install -o root -g "$group" -m "$mode" -- "$src" "$tmp"
   mv -f -- "$tmp" "$dest"
 }
+# 删除前同样备份，失败时由 rollback 放回。
+remove_file() {
+  local dest=$1 i=${#targets[@]}
+  [[ -e $dest ]] || return 0
+  [[ ! -L $dest ]] || fail "不删除符号链接：$dest"
+  cp -a -- "$dest" "$backup/$i"
+  existed+=(yes)
+  targets+=("$dest")
+  printf '%s\t%s\t%s\n' "$i" yes "$dest" >> "$backup/files.tsv"
+  rm -f -- "$dest"
+}
+
+# 域名列表：小写、去掉末尾点、逐个校验且不重复；可用空格或逗号分隔。
+normalize_domains() {
+  local raw item
+  local -a items
+  domains=()
+  for raw; do
+    IFS=', ' read -r -a items <<< "$raw"
+    for item in "${items[@]}"; do
+      [[ -n $item ]] || continue
+      item=${item,,}; item=${item%.}
+      valid_domain "$item" || fail "请填写域名，不带协议、路径、端口或 IP：$item"
+      ! contains "$item" "${domains[@]}" || fail "域名重复：$item"
+      domains+=("$item")
+    done
+  done
+}
 
 main() {
-  local action=install domain='' email='' port='' url='' version='' builtin=false noninteractive=false dry=false dns_wait=180
-  local arg old old_port current_domain missing=() p os_id os_version
+  local action=install email='' port='' url='' version='' builtin=false noninteractive=false dry=false dns_wait=180
+  local arg old old_port current_domain missing=() p os_id os_version name ip multi=false
+  local -a given=() domains=() old_nodes=() extras=() removed=() node_ips=() configs=()
   if [[ ${1:-} != -* && $# -gt 0 ]]; then action=$1; shift; fi
   case $action in install|upgrade|reconfigure) ;; *) fail '操作只能是 install、upgrade 或 reconfigure。';; esac
   while (( $# )); do
@@ -191,13 +269,13 @@ main() {
       --non-interactive) noninteractive=true;; --dry-run) dry=true;; --builtin-site) builtin=true;;
       --domain|--email|--port|--masquerade-url|--version|--dns-wait)
         if (( $# == 0 )) || [[ -z $1 || $1 == --* ]]; then fail "$arg 缺少值。"; fi
-        case $arg in --domain) domain=$1;; --email) email=$1;; --port) port=$1;; --masquerade-url) url=$1;; --version) version=$1;; --dns-wait) dns_wait=$1;; esac
+        case $arg in --domain) given+=("$1");; --email) email=$1;; --port) port=$1;; --masquerade-url) url=$1;; --version) version=$1;; --dns-wait) dns_wait=$1;; esac
         shift;;
       *) fail "未知参数：$arg";;
     esac
   done
   [[ $builtin == false || -z $url ]] || fail '不能同时指定两种伪装网页。'
-  [[ $action != upgrade || ( -z $domain$email$port$url && $builtin == false ) ]] || fail 'upgrade 只升级核心。'
+  [[ $action != upgrade || ( ${#given[@]} == 0 && -z $email$port$url && $builtin == false ) ]] || fail 'upgrade 只升级核心。'
   [[ $action != reconfigure || -z $version ]] || fail 'reconfigure 不升级核心。'
   [[ -z $version || $version =~ ^(app/)?v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail '版本格式应为 v2.x.x。'
   number "$dns_wait" || fail 'DNS 等待秒数格式不正确。'
@@ -205,7 +283,7 @@ main() {
   if [[ -n $port ]]; then if ! number "$port" || ((10#$port < 1 || 10#$port > 65535)); then fail '端口必须为 1–65535。'; fi; port=$((10#$port)); fi
   [[ -z $email || $email =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || fail '邮箱格式错误。'
   [[ -z $url || $url =~ ^https://[a-zA-Z0-9.-]+(:[0-9]+)?([/?#][^[:space:]]*)?$ ]] || fail '伪装网页必须为 HTTPS 地址。'
-  if [[ -n $domain ]]; then domain=${domain,,}; domain=${domain%.}; valid_domain "$domain" || fail '请填写域名，不带协议、路径、端口或 IP。'; fi
+  if (( ${#given[@]} )); then normalize_domains "${given[@]}"; fi
 
   if [[ $dry == false ]]; then
     [[ $EUID == 0 && $(uname -s) == Linux ]] || fail '请在 Debian 13.x 上使用 root 运行。'
@@ -233,34 +311,39 @@ main() {
   if [[ $action != install ]]; then
     [[ -s $CONFIG && -x $BINARY && -f $UNIT ]] || fail '未找到完整安装。'
   fi
+  while IFS= read -r name; do [[ -z $name ]] || old_nodes+=("$name"); done < <(extra_nodes)
   if [[ $action != upgrade ]]; then
     if [[ $old != '{}' ]]; then
       jq -e '.auth.type=="password" and (.auth.password|type=="string" and length>0) and
         ((.obfs==null) or (.obfs.type=="salamander" and (.obfs.salamander.password|type=="string" and length>0)))' <<< "$old" >/dev/null || fail '现有认证或混淆设置不受支持。'
     fi
     current_domain=$(jq -r '.acme.domains[0] // ""' <<< "$old")
-    if [[ -z $domain ]]; then
-      domain=$current_domain
+    if (( ${#domains[@]} == 0 )); then
+      arg="$current_domain ${old_nodes[*]}"; arg=${arg% }
       if [[ $noninteractive == false ]]; then
-        printf '连接域名 [%s]: ' "$domain" > /dev/tty
-        read -r arg < /dev/tty || fail '无法读取域名，请用 --domain。'
-        domain=${arg:-$domain}
+        printf '连接域名，多个 IPv4 节点用空格分隔 [%s]: ' "$arg" > /dev/tty
+        read -r p < /dev/tty || fail '无法读取域名，请用 --domain。'
+        arg=${p:-$arg}
       fi
+      normalize_domains "$arg"
     fi
-    domain=${domain,,}; domain=${domain%.}
-    valid_domain "$domain" || fail '需要正确的连接域名。'
+    (( ${#domains[@]} )) || fail '需要正确的连接域名。'
+    extras=("${domains[@]:1}")
+    (( ${#extras[@]} == 0 )) || multi=true
+    for name in "${old_nodes[@]}"; do contains "$name" "${extras[@]}" || removed+=("$name"); done
     old_port=$(jq -r '.listen // ":443"' <<< "$old")
     [[ $old_port =~ :[0-9]+$ ]] || fail '现有监听方式不受支持。'
     port=${port:-${old_port##*:}}
     if ! number "$port" || ((10#$port < 1 || 10#$port > 65535)); then fail '端口必须为 1–65535。'; fi
     port=$((10#$port))
-  fi
-  printf '操作：%s；%s\n' "$action" "${domain:-保留已有配置}"
+  else extras=("${old_nodes[@]}"); fi
+  printf '操作：%s；%s\n' "$action" "${domains[*]:-保留已有配置}"
+  if (( ${#removed[@]} )); then printf '将停用附加节点：%s\n' "${removed[*]}"; fi
   if [[ $dry == true ]]; then printf '检查通过，未修改系统。\n'; return; fi
 
   umask 077
   transaction=false stage='' work='' backup='' had_unit=false was_active=false
-  targets=() existed=() pending=()
+  targets=() existed=() pending=() touched_nodes=() enabled_nodes=() active_nodes=()
   trap cleanup EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
@@ -268,34 +351,66 @@ main() {
   install -d -o hysteria -g hysteria -m 700 "$DATA" "$DATA/acme"
   work=$(mktemp -d "$DATA/.install-XXXXXXXX")
   chown hysteria:hysteria "$work"
+  install -d -o hysteria -g hysteria -m 700 "$work/nodes"
   printf '%s\n' "$old" > "$work/old.json"
-  if [[ $action == upgrade ]]; then cp "$CONFIG" "$work/config.json"
+  if [[ $action == upgrade ]]; then
+    cp "$CONFIG" "$work/config.json"
+    for name in "${extras[@]}"; do cp "$NODES/$name.yaml" "$work/nodes/$name.json"; done
   else
-    prepare_config "$work/old.json" "$work/config.json" "$domain" "$email" "$port" "$url" "$builtin"
-    dns_check "$domain" "$dns_wait"
+    prepare_config "$work/old.json" "$work/config.json" "${domains[0]}" "$email" "$port" "$url" "$builtin"
+    for name in "${extras[@]}"; do
+      if [[ -e $NODES/$name.yaml ]]; then cp "$NODES/$name.yaml" "$work/nodes/$name.old"; else printf '{}\n' > "$work/nodes/$name.old"; fi
+      prepare_config "$work/nodes/$name.old" "$work/nodes/$name.json" "$name" "$email" "$port" "$url" "$builtin"
+    done
+    if [[ $multi == true ]]; then
+      for name in "${domains[@]}"; do
+        ip=$(dns_check "$name" "$dns_wait" true)
+        ! contains "$ip" "${node_ips[@]}" || fail "多个域名解析到同一个 IP：$ip。每个节点需要不同的 IPv4。"
+        node_ips+=("$ip")
+        egress_check "$ip"
+        printf '%s → %s，出口确认\n' "$name" "$ip"
+      done
+      node_config "$work/config.json" "$work/config.ip" "${node_ips[0]}"
+      mv "$work/config.ip" "$work/config.json"
+      for ((p=1; p<${#domains[@]}; p++)); do
+        node_config "$work/nodes/${domains[p]}.json" "$work/nodes/${domains[p]}.ip" "${node_ips[p]}"
+        mv "$work/nodes/${domains[p]}.ip" "$work/nodes/${domains[p]}.json"
+      done
+    else dns_check "${domains[0]}" "$dns_wait"; fi
     if [[ $(jq -r '.acme.type // "http"' "$work/config.json") == http ]]; then port_free t 80 || fail 'TCP 80 已占用。'; fi
-    if ! port_free u "$port"; then
-      if [[ ${old_port##*:} != "$port" ]] || ! systemctl is-active --quiet hysteria-server; then fail "UDP $port 已占用。"; fi
-    fi
+    if ! port_free u "$port" && ! port_held_by_hysteria "$port"; then fail "UDP $port 已被其它程序占用。"; fi
   fi
+  configs=("$work/config.json")
+  for name in "${extras[@]}"; do configs+=("$work/nodes/$name.json"); done
   if [[ $action == reconfigure ]]; then cp "$BINARY" "$work/hysteria"; chmod 755 "$work/hysteria"
   else download_binary "$work/hysteria" "$version"; fi
-  jq '.listen="0.0.0.0:0" | .masquerade={type:"string",string:{content:"setup"}}' "$work/config.json" > "$work/preview.json"
-  chown hysteria:hysteria "$work/preview.json"
-  stage="hy2-setup-${work##*/}"
-  systemd-run --quiet --unit="$stage" --property=User=hysteria --property=Group=hysteria \
-    --property=AmbientCapabilities=CAP_NET_BIND_SERVICE "$work/hysteria" server -c "$work/preview.json"
-  wait_ready "$stage" 240
-  systemctl stop "$stage"
+  for p in "${configs[@]}"; do
+    jq '.listen="0.0.0.0:0" | .masquerade={type:"string",string:{content:"setup"}}' "$p" > "$work/preview.json"
+    chown hysteria:hysteria "$work/preview.json"
+    stage="hy2-setup-${work##*/}"
+    systemd-run --quiet --unit="$stage" --property=User=hysteria --property=Group=hysteria \
+      --property=AmbientCapabilities=CAP_NET_BIND_SERVICE "$work/hysteria" server -c "$work/preview.json"
+    wait_ready "$stage" 240
+    systemctl stop "$stage"
+    systemctl reset-failed "$stage" >/dev/null 2>&1 || true
+  done
+  stage=''
   if [[ $action != upgrade ]]; then
-    export_client "$work/config.json" "$work"
+    export_client "$work" "${configs[@]}"
     write_site > "$work/index.html"
     write_service > "$work/service"
+    write_template > "$work/template"
   fi
   backup=$(mktemp -d /root/hy2-backup-XXXXXXXX)
   [[ ! -f $UNIT ]] || had_unit=true
   if systemctl is-active --quiet hysteria-server; then was_active=true; fi
-  printf 'active=%s\nunit_existed=%s\n' "$was_active" "$had_unit" > "$backup/state"
+  touched_nodes=("${old_nodes[@]}")
+  for name in "${extras[@]}"; do contains "$name" "${touched_nodes[@]}" || touched_nodes+=("$name"); done
+  for name in "${old_nodes[@]}"; do
+    if systemctl is-enabled --quiet "hysteria-server@$name" 2>/dev/null; then enabled_nodes+=("$name"); fi
+    if systemctl is-active --quiet "hysteria-server@$name"; then active_nodes+=("$name"); fi
+  done
+  printf 'active=%s\nunit_existed=%s\nactive_nodes=%s\n' "$was_active" "$had_unit" "${active_nodes[*]}" > "$backup/state"
   transaction=true
   if [[ $action != reconfigure ]]; then replace_file "$work/hysteria" "$BINARY" 755; fi
   if [[ $action != upgrade ]]; then
@@ -303,6 +418,12 @@ main() {
     install -d -o root -g root -m 700 "$EXPORT"
     replace_file "$work/config.json" "$CONFIG" 640 hysteria
     if [[ $had_unit == false ]]; then replace_file "$work/service" "$UNIT" 644; fi
+    if (( ${#extras[@]} )); then
+      install -d -o root -g hysteria -m 750 "$NODES"
+      if [[ ! -f $TEMPLATE ]]; then replace_file "$work/template" "$TEMPLATE" 644; fi
+    fi
+    for name in "${extras[@]}"; do replace_file "$work/nodes/$name.json" "$NODES/$name.yaml" 640 hysteria; done
+    for name in "${removed[@]}"; do remove_file "$NODES/$name.yaml"; done
     if [[ $(jq -r '.masquerade.file.dir // ""' "$work/config.json") == "$DATA/www" && ! -e $DATA/www/index.html ]]; then
       replace_file "$work/index.html" "$DATA/www/index.html" 644
       chmod 755 "$DATA/www"
@@ -311,10 +432,21 @@ main() {
     replace_file "$work/hy2.txt" "$EXPORT/hy2.txt" 600
   fi
   systemctl daemon-reload
+  # 先停掉附加节点，主节点从 0.0.0.0 改为绑定单个 IP 后再逐个启动，避免端口冲突。
+  for name in "${old_nodes[@]}"; do systemctl stop "hysteria-server@$name"; done
+  for name in "${removed[@]}"; do
+    systemctl disable --quiet "hysteria-server@$name" 2>/dev/null || rm -f "/etc/systemd/system/multi-user.target.wants/hysteria-server@$name.service"
+  done
   systemctl reset-failed hysteria-server 2>/dev/null || true
   systemctl restart hysteria-server
   wait_ready hysteria-server 30
+  for name in "${extras[@]}"; do
+    systemctl reset-failed "hysteria-server@$name" 2>/dev/null || true
+    systemctl restart "hysteria-server@$name"
+    wait_ready "hysteria-server@$name" 30
+  done
   if [[ $had_unit == false ]]; then systemctl enable hysteria-server; fi
+  for name in "${extras[@]}"; do systemctl enable --quiet "hysteria-server@$name"; done
   transaction=false
   printf '部署完成。备份：%s\n' "$backup"
   if [[ $action != upgrade ]]; then
@@ -340,6 +472,32 @@ User=hysteria
 Group=hysteria
 WorkingDirectory=/var/lib/hysteria
 ExecStart=/usr/local/bin/hysteria server --config /etc/hysteria/config.yaml
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/hysteria
+Restart=on-failure
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+
+HY2_ASSET
+}
+
+write_template() {
+  cat <<'HY2_ASSET'
+[Unit]
+Description=Hysteria 2 Server (%i)
+After=network-online.target
+Wants=network-online.target
+[Service]
+User=hysteria
+Group=hysteria
+WorkingDirectory=/var/lib/hysteria
+ExecStart=/usr/local/bin/hysteria server --config /etc/hysteria/nodes/%i.yaml
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 NoNewPrivileges=true
