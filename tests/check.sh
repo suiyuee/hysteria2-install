@@ -35,11 +35,28 @@ export_client "$work" "$work/new"
 jq -e --slurpfile old "$work/old" '.proxies[0].password==$old[0].auth.password and .proxies[0]["skip-cert-verify"]==false and .proxies[0]["obfs-password"]==$old[0].obfs.salamander.password' "$work/clash.yaml" >/dev/null
 grep -Fq 'obfs-password=b%20%26%3F%3D' "$work/hy2.txt"
 jq -e '.ipv6==false and .dns.ipv6==false and .proxies[0]["ip-version"]=="ipv4" and .proxies[0].name=="hy.example.com"' "$work/clash.yaml" >/dev/null
+prepare_v6_config "$work/new" "$work/_v6-hy.example.com.json" 444
+jq -e '.listen=="0.0.0.0:444" and .outbounds[0].direct.mode=="64"' "$work/_v6-hy.example.com.json" >/dev/null
+export_client "$work" "$work/new" "$work/_v6-hy.example.com.json"
+jq -e '(.proxies|map(.name))==["hy.example.com","hy.example.com (IPv6)"] and .proxies[1].port==444' "$work/clash.yaml" >/dev/null
+grep -Eq '@hy.example.com:444/.*obfs-password=b%20%26%3F%3D#hy.example.com%20(%28|\()IPv6(%29|\))$' "$work/hy2.txt"
+(
+  ip() { return 1; }
+  [[ $(ipv6_egress) == no-route ]]
+  ip() { return 0; }
+  curl() { return 1; }
+  [[ $(ipv6_egress) == unconfirmed ]]
+  curl() { [[ $* == *"--ipv6 --noproxy *"* && ${!#} == https://dns.google/ ]]; }
+  [[ $(ipv6_egress) == available ]]
+)
 # DNS must point only to local IPv4, including on a dual-stack host.
 (
   ip() { printf '%s\n' '[{"addr_info":[{"scope":"global","family":"inet","local":"192.0.2.1"},{"scope":"global","family":"inet6","local":"2001:db8::1"}]}]'; }
   getent() { printf '192.0.2.1 STREAM\n'; }
   dns_check hy.example.com 0
+  getent() { [[ -f $work/dns-ready ]] && printf '192.0.2.1 STREAM\n'; }
+  sleep() { [[ $1 == 5 ]]; touch "$work/dns-ready"; }
+  [[ $(dns_check hy.example.com forever true) == 192.0.2.1 ]]
   getent() { printf '192.0.2.1 STREAM\n2001:db8::1 STREAM\n'; }
   if (dns_check hy.example.com 0) >/dev/null 2>&1; then echo 'accepted AAAA record'; exit 1; fi
 )
@@ -71,6 +88,8 @@ jq -e '(.proxies|map(.name))==["hy.example.com","hy-b.example.com"] and (.proxie
   if port_held_by_hysteria 443; then echo 'treated foreign listener as hysteria'; exit 1; fi
 )
 if (( BASH_VERSINFO[0] >= 4 )); then
+  bash -s -- --domain hy.suiyuee.top --dry-run < hysteria.sh > "$work/pipe-domain"
+  grep -Fq 'hy.suiyuee.top' "$work/pipe-domain"
   normalize_domains 'HY.example.com.' 'hy-b.example.com, hy-c.example.com'
   [[ "${domains[*]}" == 'hy.example.com hy-b.example.com hy-c.example.com' ]]
   if (normalize_domains a.example.com A.example.com) >/dev/null 2>&1; then echo 'accepted duplicate domain'; exit 1; fi
@@ -107,12 +126,22 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 90 -subj "/CN=$domain" -addext "
 printf '{"sans":["%s"],"issuer_data":{}}\n' "$domain" > "$cert_dir/$domain.json"
 chown -R hysteria:hysteria /var/lib/hysteria
 sha256sum "$cert_dir/$domain.crt" > "$scratch/cert.sha"
-bash hysteria.sh --domain "$domain" --port 24443 --non-interactive > "$scratch/install.log" 2>&1 || { cat "$scratch/install.log"; exit 1; }
+# Make the host's egress state deterministic; QUIC and both address families are real.
+cat > "$scratch/deploy" <<'DEPLOY'
+source /repo/hysteria.sh
+ipv6_egress() { echo "${TEST_V6:-available}"; }
+main "$@"
+DEPLOY
+TEST_V6=no-route bash "$scratch/deploy" --domain "$domain" --port 24443 --non-interactive > "$scratch/install.log" 2>&1 || { cat "$scratch/install.log"; exit 1; }
 if command -v python3; then echo "Unexpected Python runtime"; exit 1; fi
 [[ $(stat -c '%U:%G:%a' /etc/hysteria/config.yaml) == root:hysteria:640 ]]
 [[ $(stat -c %a /etc/hysteria/client/clash.yaml) == 600 ]]
 jq -e '.proxies[0]["skip-cert-verify"]==false' /etc/hysteria/client/clash.yaml >/dev/null
 printf 'PASS fresh install on Debian 13 without Python; permissions and exports\n'
+jq -e '(.proxies|length)==1' /etc/hysteria/client/clash.yaml >/dev/null
+[[ ! -e /etc/hysteria/nodes/_v6-$domain.yaml && -z $(ss -H -lun 'sport = :24444') ]]
+bash "$scratch/deploy" reconfigure --non-interactive > "$scratch/add-v6.log" 2>&1 || { cat "$scratch/add-v6.log"; exit 1; }
+systemctl is-active --quiet "hysteria-server@_v6-$domain"
 bash tests/check.sh
 LANG=C.UTF-8 shellcheck -x hysteria.sh tests/check.sh
 
@@ -126,12 +155,27 @@ curl -fsS --max-time 30 --proxy socks5h://127.0.0.1:21080 https://www.gstatic.co
 kill "$client_pid"; wait "$client_pid" || true; client_pid=''
 printf 'PASS real QUIC proxy with certificate verification\n'
 
+# Only IPv6 serves the dual-stack name on its test port; the A-only name needs IPv4.
+printf '\n127.0.0.1 dual.hy2.test v4.hy2.test\n::1 dual.hy2.test\n' >> /etc/hosts
+for endpoint in '[::1]:21446' '127.0.0.1:21444'; do
+  openssl s_server -quiet -www -accept "$endpoint" -cert "$cert_dir/$domain.crt" -key "$cert_dir/$domain.key" > /dev/null 2>&1 &
+done
+jq '.server |= sub(":24443$"; ":24444")' "$scratch/client.json" > "$scratch/client-v6.json"
+/usr/local/bin/hysteria client -c "$scratch/client-v6.json" > "$scratch/client-v6.log" 2>&1 & client_pid=$!
+for target in dual.hy2.test:21446 v4.hy2.test:21444; do
+  curl -kfSs --retry 5 --retry-connrefused --max-time 10 --noproxy '' --proxy socks5h://127.0.0.1:21080 "https://$target/" >/dev/null
+done
+kill "$client_pid"; wait "$client_pid" || true; client_pid=''
+printf 'PASS IPv6 preference for dual-stack and IPv4 fallback for A-only over QUIC\n'
+
 config=/etc/hysteria/config.yaml
 jq '.masquerade={type:"string",string:{content:"keep-custom"}} | .quic={maxIdleTimeout:"40s"}' "$config" > "$scratch/custom"
 install -o root -g hysteria -m 640 "$scratch/custom" "$config"
 sha256sum /usr/local/bin/hysteria > "$scratch/binary.sha"
 cp "$config" "$scratch/before"
-bash hysteria.sh --non-interactive > "$scratch/reconfigure.log" 2>&1 || { cat "$scratch/reconfigure.log"; exit 1; }
+TEST_V6=unconfirmed bash "$scratch/deploy" --non-interactive > "$scratch/reconfigure.log" 2>&1 || { cat "$scratch/reconfigure.log"; exit 1; }
+systemctl is-active --quiet "hysteria-server@_v6-$domain"
+jq -e '(.proxies|length)==2' /etc/hysteria/client/clash.yaml >/dev/null
 sha256sum -c "$scratch/cert.sha" "$scratch/binary.sha"
 for field in auth listen masquerade quic acme; do
  [[ $(jq -c ".$field" "$config") == "$(jq -c ".$field" "$scratch/before")" ]]
@@ -177,6 +221,7 @@ chown -R hysteria:hysteria /var/lib/hysteria
 cat > "$scratch/multi.sh" <<'MULTI'
 #!/usr/bin/env bash
 source /repo/hysteria.sh
+ipv6_egress() { echo "${TEST_V6:-available}"; }
 egress_check() { printf 'egress check skipped for %s\n' "$1"; }
 main "$@"
 MULTI
@@ -192,8 +237,8 @@ for pair in "hy2b.integration.test $ip2" "hy2c.integration.test $ip3"; do
   jq -e --arg ip "$extra_ip" '.listen==($ip+":24443") and .acme.listenHost==$ip and .outbounds[0].direct.bindIPv4==$ip and .outbounds[0].direct.mode=="4"' "/etc/hysteria/nodes/$extra.yaml" >/dev/null
   ss -H -lun "sport = :24443" | grep -Fq "$extra_ip:24443"
 done
-jq -e '(.proxies|length)==3' /etc/hysteria/client/clash.yaml >/dev/null
-[[ $(grep -c '^hysteria2://' /etc/hysteria/client/hy2.txt) == 3 ]]
+jq -e '(.proxies|length)==6' /etc/hysteria/client/clash.yaml >/dev/null
+[[ $(grep -c '^hysteria2://' /etc/hysteria/client/hy2.txt) == 6 ]]
 cert_b=/var/lib/hysteria/acme/certificates/acme-v02.api.letsencrypt.org-directory/hy2b.integration.test/hy2b.integration.test.crt
 jq --arg cert "$cert_b" '{server:"hy2b.integration.test:24443",auth:.auth.password,tls:{sni:"hy2b.integration.test",ca:$cert},socks5:{listen:"127.0.0.1:21081"}}' /etc/hysteria/nodes/hy2b.integration.test.yaml > "$scratch/client-b.json"
 /usr/local/bin/hysteria client -c "$scratch/client-b.json" > "$scratch/client-b.log" 2>&1 & client_pid=$!
@@ -210,7 +255,7 @@ systemctl is-active --quiet hysteria-server@hy2b.integration.test
 if systemctl is-active --quiet hysteria-server@hy2c.integration.test; then echo 'removed node still running'; exit 1; fi
 if systemctl is-enabled --quiet hysteria-server@hy2c.integration.test 2>/dev/null; then echo 'removed node still enabled'; exit 1; fi
 [[ ! -e /etc/hysteria/nodes/hy2c.integration.test.yaml ]]
-jq -e '(.proxies|length)==2' /etc/hysteria/client/clash.yaml >/dev/null
+jq -e '(.proxies|length)==4' /etc/hysteria/client/clash.yaml >/dev/null
 bash hysteria.sh upgrade --non-interactive > "$scratch/upgrade-multi.log" 2>&1 || { cat "$scratch/upgrade-multi.log"; exit 1; }
 systemctl is-active --quiet hysteria-server
 systemctl is-active --quiet hysteria-server@hy2b.integration.test
@@ -220,6 +265,7 @@ printf 'PASS dropping a node stops, disables and removes it; upgrade restarts ev
 cat > "$scratch/multi-fail.sh" <<'MULTI'
 #!/usr/bin/env bash
 source /repo/hysteria.sh
+ipv6_egress() { echo "${TEST_V6:-available}"; }
 egress_check() { :; }
 eval "real_$(declare -f wait_ready)"
 wait_ready() { [[ $1 != hysteria-server@hy2c.integration.test ]] || return 1; real_wait_ready "$@"; }
@@ -238,6 +284,14 @@ systemctl is-active --quiet hysteria-server@hy2b.integration.test
 systemctl is-enabled --quiet hysteria-server@hy2b.integration.test
 printf 'PASS failed multi-node switch restores existing nodes, exports and enablement\n'
 if command -v python3; then echo "Unexpected Python runtime"; exit 1; fi
+TEST_V6=no-route bash "$scratch/multi.sh" reconfigure --non-interactive > "$scratch/remove-v6.log" 2>&1 || { cat "$scratch/remove-v6.log"; exit 1; }
+jq -e '(.proxies|length)==2 and all(.proxies[];.port==24443)' /etc/hysteria/client/clash.yaml >/dev/null
+[[ -z $(ss -H -lun 'sport = :24444') ]]
+for extra in "$domain" hy2b.integration.test; do
+  [[ ! -e /etc/hysteria/nodes/_v6-$extra.yaml ]]
+  if systemctl is-enabled --quiet "hysteria-server@_v6-$extra" 2>/dev/null; then exit 1; fi
+done
+printf 'PASS IPv4-only install, adding IPv6, retaining nodes on probe failure and removing them on route loss\n'
 printf 'ALL DEBIAN 13 BASH CHECKS PASSED\n'
 )
 

@@ -15,17 +15,18 @@ fail() { printf '部署未完成：%s\n' "$*" >&2; exit 1; }
 usage() {
   cat <<'HELP'
 用法：bash hysteria.sh [install|upgrade|reconfigure] [参数]
-Debian 13.x / systemd，仅 IPv4。默认安装，已有配置时改为重新配置。
+Debian 13.x / systemd，IPv4 接入，自动检测 IPv6 出口。默认安装，已有配置时改为重新配置。
 多个域名即多个 IPv4 节点；重新配置时不在列表里的附加节点会被停用并删除配置。
   --domain 域名          直接解析到本机；可重复或用逗号分隔。多个域名时
                          每个域名的 A 记录指向本机一个不同的 IPv4，
                          各自监听并从该 IP 出网
   --port 端口            新安装默认 443
+  --v6-port 端口         IPv6 优先节点的 UDP 端口，默认主端口 + 1（65535 时取 65534）
   --email 邮箱           可选，新安装默认不填
   --masquerade-url URL   HTTPS 伪装网页
   --builtin-site         使用内置网页
   --version v2.x.x       安装/升级指定版本，默认最新稳定版
-  --dns-wait 秒数        默认 180
+  --dns-wait 秒数|forever 默认一直等待 DNS，每 5 秒检查一次
   --non-interactive      不提问
   --dry-run              只检查输入和计划，不改系统（需要已有 jq）
   --help                 显示帮助
@@ -76,19 +77,42 @@ node_config() {
     .outbounds |= map(if .type == "direct" then .direct.bindIPv4 = $ip | del(.direct.bindDevice) else . end)' "$src" > "$output"
 }
 
+# A verified TLS response proves direct IPv6 reachability, regardless of HTTP status.
+ipv6_egress() {
+  local endpoint host addr state=no-route
+  for endpoint in 'cloudflare-dns.com 2606:4700:4700::1111' 'dns.google 2001:4860:4860::8888'; do
+    read -r host addr <<< "$endpoint"
+    ip -6 route get "$addr" >/dev/null 2>&1 || continue
+    state=unconfirmed
+    if curl -q --ipv6 --noproxy '*' --resolve "$host:443:[$addr]" --silent \
+        --output /dev/null --connect-timeout 3 --max-time 5 "https://$host/"; then
+      printf 'available\n'; return
+    fi
+  done
+  printf '%s\n' "$state"
+}
+
+prepare_v6_config() {
+  jq --arg port "$3" '
+    .listen |= sub(":[0-9]+$"; ":" + $port) |
+    .outbounds |= map(if .type == "direct" then .direct.mode = "64" else . end) |
+    del(.masquerade.listenHTTP, .masquerade.listenHTTPS, .trafficStats)
+  ' "$1" > "$2"
+}
+
 export_client() {
   local dest=$1; shift
-  jq -s '
+  jq -n '
     def node: .acme.domains[0] as $d | (.listen | split(":") | last | tonumber) as $port |
-      {name:$d,type:"hysteria2",server:$d,port:$port,"ip-version":"ipv4",password:.auth.password,sni:$d,"skip-cert-verify":false}
+      {name:(if (input_filename | split("/") | last | startswith("_v6-")) then $d+" (IPv6)" else $d end),type:"hysteria2",server:$d,port:$port,"ip-version":"ipv4",password:.auth.password,sni:$d,"skip-cert-verify":false}
       + (if .obfs.type == "salamander" then {obfs:"salamander","obfs-password":.obfs.salamander.password} else {} end);
-    map(node) as $nodes |
+    [inputs | node] as $nodes |
     {"mixed-port":7890,"allow-lan":false,ipv6:false,dns:{ipv6:false},mode:"rule",proxies:$nodes,
      "proxy-groups":[{name:"代理选择",type:"select",proxies:(($nodes | map(.name)) + ["DIRECT"])}],
      rules:["IP-CIDR,127.0.0.0/8,DIRECT","IP-CIDR,10.0.0.0/8,DIRECT","IP-CIDR,172.16.0.0/12,DIRECT","IP-CIDR,192.168.0.0/16,DIRECT","MATCH,代理选择"]}' "$@" > "$dest/clash.yaml"
-  jq -r '.acme.domains[0] as $d |
-    "hysteria2://" + (.auth.password|@uri) + "@" + $d + ":" + (.listen|split(":")|last) + "/?sni=" + $d + "&insecure=0" +
-    (if .obfs.type == "salamander" then "&obfs=salamander&obfs-password=" + (.obfs.salamander.password|@uri) else "" end) + "#" + $d' "$@" > "$dest/hy2.txt"
+  jq -r '.proxies[] |
+    "hysteria2://" + (.password|@uri) + "@" + .server + ":" + (.port|tostring) + "/?sni=" + .sni + "&insecure=0" +
+    (if .obfs then "&obfs=salamander&obfs-password=" + (.["obfs-password"]|@uri) else "" end) + "#" + (.name|@uri)' "$dest/clash.yaml" > "$dest/hy2.txt"
 }
 
 verify_binary() {
@@ -114,7 +138,8 @@ download_binary() {
 
 # 域名只解析到本机 IPv4；single=true 时只能有一条 A 记录，并输出该 IP。
 dns_check() {
-  local domain=$1 end=$((SECONDS + $2)) single=${3:-false} local_ips resolved ip good
+  local domain=$1 wait=$2 end=0 single=${3:-false} local_ips resolved ip good
+  if [[ $wait != forever ]]; then end=$((SECONDS + wait)); fi
   local_ips=$(local_ipv4s)
   while :; do
     resolved=$(getent -A ahosts "$domain" | awk '{print $1}' | sort -u) || resolved=''
@@ -128,11 +153,11 @@ dns_check() {
       if [[ $single == true ]]; then printf '%s\n' "$resolved"; fi
       return
     fi
-    if (( SECONDS >= end )); then
+    if [[ $wait != forever ]] && (( SECONDS >= end )); then
       if [[ $single == true ]]; then fail "DNS 未就绪：$domain。多节点时每个域名只能有一条 A 记录，指向本机的一个 IPv4；删除 AAAA 记录并关闭 CDN。"; fi
       fail "DNS 未就绪：$domain。请将 A 记录指向本机 IPv4，删除 AAAA 记录并关闭 CDN。"
     fi
-    printf '等待 DNS 生效……\n' >&2
+    printf '等待 %s 的 A 记录指向本机 IPv4，5 秒后重试（Ctrl+C 取消）……\n' "$domain" >&2
     sleep 5
   done
 }
@@ -257,7 +282,9 @@ normalize_domains() {
 }
 
 main() {
-  local action=install email='' port='' url='' version='' builtin=false noninteractive=false dry=false dns_wait=180
+  local action=install email='' port='' url='' version='' builtin=false noninteractive=false dry=false dns_wait=forever
+  local v6_port='' old_v6_port='' v6_state src
+  local -a v6_domains=() ports=()
   local arg old old_port current_domain missing=() p os_id os_version name ip multi=false
   local -a given=() domains=() old_nodes=() extras=() removed=() node_ips=() configs=()
   if [[ ${1:-} != -* && $# -gt 0 ]]; then action=$1; shift; fi
@@ -267,19 +294,21 @@ main() {
     case $arg in
       --help|-h) usage; return;;
       --non-interactive) noninteractive=true;; --dry-run) dry=true;; --builtin-site) builtin=true;;
-      --domain|--email|--port|--masquerade-url|--version|--dns-wait)
+      --domain|--email|--port|--v6-port|--masquerade-url|--version|--dns-wait)
         if (( $# == 0 )) || [[ -z $1 || $1 == --* ]]; then fail "$arg 缺少值。"; fi
-        case $arg in --domain) given+=("$1");; --email) email=$1;; --port) port=$1;; --masquerade-url) url=$1;; --version) version=$1;; --dns-wait) dns_wait=$1;; esac
+        case $arg in --domain) given+=("$1");; --email) email=$1;; --port) port=$1;; --v6-port) v6_port=$1;; --masquerade-url) url=$1;; --version) version=$1;; --dns-wait) dns_wait=$1;; esac
         shift;;
       *) fail "未知参数：$arg";;
     esac
   done
   [[ $builtin == false || -z $url ]] || fail '不能同时指定两种伪装网页。'
-  [[ $action != upgrade || ( ${#given[@]} == 0 && -z $email$port$url && $builtin == false ) ]] || fail 'upgrade 只升级核心。'
+  [[ $action != upgrade || ( ${#given[@]} == 0 && -z $email$port$v6_port$url && $builtin == false ) ]] || fail 'upgrade 只升级核心。'
   [[ $action != reconfigure || -z $version ]] || fail 'reconfigure 不升级核心。'
   [[ -z $version || $version =~ ^(app/)?v[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail '版本格式应为 v2.x.x。'
-  number "$dns_wait" || fail 'DNS 等待秒数格式不正确。'
-  dns_wait=$((10#$dns_wait))
+  if [[ $dns_wait != forever ]]; then
+    number "$dns_wait" || fail 'DNS 等待时间应为秒数或 forever。'
+    dns_wait=$((10#$dns_wait))
+  fi
   if [[ -n $port ]]; then if ! number "$port" || ((10#$port < 1 || 10#$port > 65535)); then fail '端口必须为 1–65535。'; fi; port=$((10#$port)); fi
   [[ -z $email || $email =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]] || fail '邮箱格式错误。'
   [[ -z $url || $url =~ ^https://[a-zA-Z0-9.-]+(:[0-9]+)?([/?#][^[:space:]]*)?$ ]] || fail '伪装网页必须为 HTTPS 地址。'
@@ -319,7 +348,8 @@ main() {
     fi
     current_domain=$(jq -r '.acme.domains[0] // ""' <<< "$old")
     if (( ${#domains[@]} == 0 )); then
-      arg="$current_domain ${old_nodes[*]}"; arg=${arg% }
+      arg="$current_domain"
+      for name in "${old_nodes[@]}"; do [[ $name == _v6-* ]] || arg+=" $name"; done
       if [[ $noninteractive == false ]]; then
         printf '连接域名，多个 IPv4 节点用空格分隔 [%s]: ' "$arg" > /dev/tty
         read -r p < /dev/tty || fail '无法读取域名，请用 --domain。'
@@ -330,12 +360,37 @@ main() {
     (( ${#domains[@]} )) || fail '需要正确的连接域名。'
     extras=("${domains[@]:1}")
     (( ${#extras[@]} == 0 )) || multi=true
+    if command -v ip >/dev/null; then v6_state=$(ipv6_egress); else v6_state=unconfirmed; fi
+    case $v6_state in
+      no-route) printf '没有公网 IPv6 路由，仅配置 IPv4 节点。\n';;
+      unconfirmed) printf '未确认 IPv6 出口，仅保留所选域名已有的 IPv6 节点。\n';;
+    esac
+    for name in "${domains[@]}"; do
+      if [[ $v6_state == available ]] || { [[ $v6_state == unconfirmed ]] && contains "_v6-$name" "${old_nodes[@]}"; }; then
+        v6_domains+=("$name")
+        extras+=("_v6-$name")
+      fi
+    done
     for name in "${old_nodes[@]}"; do contains "$name" "${extras[@]}" || removed+=("$name"); done
     old_port=$(jq -r '.listen // ":443"' <<< "$old")
     [[ $old_port =~ :[0-9]+$ ]] || fail '现有监听方式不受支持。'
     port=${port:-${old_port##*:}}
     if ! number "$port" || ((10#$port < 1 || 10#$port > 65535)); then fail '端口必须为 1–65535。'; fi
     port=$((10#$port))
+    ports=("$port")
+    printf 'IPv4 节点 UDP %s。\n' "$port"
+    if (( ${#v6_domains[@]} )); then
+      if [[ -f $NODES/_v6-$current_domain.yaml && $port == "${old_port##*:}" ]]; then
+        old_v6_port=$(jq -r '.listen|split(":")|last' "$NODES/_v6-$current_domain.yaml")
+      fi
+      v6_port=${v6_port:-${old_v6_port:-$((port == 65535 ? port - 1 : port + 1))}}
+      if ! number "$v6_port" || ((10#$v6_port < 1 || 10#$v6_port > 65535 || 10#$v6_port == port)); then
+        fail 'IPv6 优先节点需要不同的有效 UDP 端口。'
+      fi
+      v6_port=$((10#$v6_port))
+      ports+=("$v6_port")
+      printf 'IPv6 优先节点 UDP %s。\n' "$v6_port"
+    fi
   else extras=("${old_nodes[@]}"); fi
   printf '操作：%s；%s\n' "$action" "${domains[*]:-保留已有配置}"
   if (( ${#removed[@]} )); then printf '将停用附加节点：%s\n' "${removed[*]}"; fi
@@ -358,7 +413,7 @@ main() {
     for name in "${extras[@]}"; do cp "$NODES/$name.yaml" "$work/nodes/$name.json"; done
   else
     prepare_config "$work/old.json" "$work/config.json" "${domains[0]}" "$email" "$port" "$url" "$builtin"
-    for name in "${extras[@]}"; do
+    for name in "${domains[@]:1}"; do
       if [[ -e $NODES/$name.yaml ]]; then cp "$NODES/$name.yaml" "$work/nodes/$name.old"; else printf '{}\n' > "$work/nodes/$name.old"; fi
       prepare_config "$work/nodes/$name.old" "$work/nodes/$name.json" "$name" "$email" "$port" "$url" "$builtin"
     done
@@ -378,7 +433,14 @@ main() {
       done
     else dns_check "${domains[0]}" "$dns_wait"; fi
     if [[ $(jq -r '.acme.type // "http"' "$work/config.json") == http ]]; then port_free t 80 || fail 'TCP 80 已占用。'; fi
-    if ! port_free u "$port" && ! port_held_by_hysteria "$port"; then fail "UDP $port 已被其它程序占用。"; fi
+    for p in "${ports[@]}"; do
+      if ! port_free u "$p" && ! port_held_by_hysteria "$p"; then fail "UDP $p 已被其它程序占用。"; fi
+    done
+    for name in "${v6_domains[@]}"; do
+      src="$work/nodes/$name.json"
+      if [[ $name == "${domains[0]}" ]]; then src="$work/config.json"; fi
+      prepare_v6_config "$src" "$work/nodes/_v6-$name.json" "$v6_port"
+    done
   fi
   configs=("$work/config.json")
   for name in "${extras[@]}"; do configs+=("$work/nodes/$name.json"); done
