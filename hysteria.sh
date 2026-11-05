@@ -100,11 +100,32 @@ prepare_v6_config() {
   ' "$1" > "$2"
 }
 
+node_country() {
+  local ip=$1
+  curl -q --ipv4 --noproxy '*' --fail --silent --connect-timeout 2 --max-time 5 \
+    "https://ipwho.is/$ip?lang=zh-CN&fields=success,country" |
+    jq -er 'select(.success == true) | .country | strings | select(length > 0 and length <= 80 and (test("[[:cntrl:]]") | not))'
+}
+
 export_client() {
-  local dest=$1; shift
-  jq -n '
+  local dest=$1 config domain ip country base name n names='{}'
+  local -a used=()
+  shift
+  for config in "$@"; do
+    [[ ${config##*/} != _v6-* ]] || continue
+    domain=$(jq -r '.acme.domains[0]' "$config")
+    ip=$(jq -r '[.outbounds[] | select(.type=="direct")][0].direct.bindIPv4 // ""' "$config")
+    country=$(node_country "$ip") || country='未知地区'
+    base="◇-$country-${domain%%.*}"
+    name=$base
+    n=1
+    while (( ${#used[@]} )) && contains "$name" "${used[@]}"; do n=$((n + 1)); name="$base~$n"; done
+    used+=("$name")
+    names=$(jq -c --arg d "$domain" --arg name "$name" '.[$d]=$name' <<< "$names")
+  done
+  jq -n --argjson names "$names" '
     def node: .acme.domains[0] as $d | (.listen | split(":") | last | tonumber) as $port |
-      {name:(if (input_filename | split("/") | last | startswith("_v6-")) then $d+" (IPv6)" else $d end),type:"hysteria2",server:$d,port:$port,"ip-version":"ipv4",password:.auth.password,sni:$d,"skip-cert-verify":false}
+      {name:(if (input_filename | split("/") | last | startswith("_v6-")) then $names[$d]+" (IPv6)" else $names[$d] end),type:"hysteria2",server:$d,port:$port,"ip-version":"ipv4",password:.auth.password,sni:$d,"skip-cert-verify":false}
       + (if .obfs.type == "salamander" then {obfs:"salamander","obfs-password":.obfs.salamander.password} else {} end);
     [inputs | node] as $nodes |
     {"mixed-port":7890,"allow-lan":false,ipv6:false,dns:{ipv6:false},mode:"rule",proxies:$nodes,

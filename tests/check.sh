@@ -31,15 +31,23 @@ prepare_config "$work/old" "$work/new" hy.example.com '' 63992 '' false
 for key in auth quic obfs acme masquerade; do
  [[ $(jq -c ".$key" "$work/old") == "$(jq -c ".$key" "$work/new")" ]]
 done
+# Simulate IP geolocation independently of the test machine's public address.
+curl() {
+  case "${!#}" in
+    'https://ipwho.is/192.0.2.2?'*) echo '{"success":true,"country":"德国"}';;
+    'https://ipwho.is/'*) echo '{"success":true,"country":"日本"}';;
+    *) return 1;;
+  esac
+}
 export_client "$work" "$work/new"
 jq -e --slurpfile old "$work/old" '.proxies[0].password==$old[0].auth.password and .proxies[0]["skip-cert-verify"]==false and .proxies[0]["obfs-password"]==$old[0].obfs.salamander.password' "$work/clash.yaml" >/dev/null
 grep -Fq 'obfs-password=b%20%26%3F%3D' "$work/hy2.txt"
-jq -e '.ipv6==false and .dns.ipv6==false and .proxies[0]["ip-version"]=="ipv4" and .proxies[0].name=="hy.example.com"' "$work/clash.yaml" >/dev/null
+jq -e '.ipv6==false and .dns.ipv6==false and .proxies[0]["ip-version"]=="ipv4" and .proxies[0].name=="◇-日本-hy"' "$work/clash.yaml" >/dev/null
 prepare_v6_config "$work/new" "$work/_v6-hy.example.com.json" 444
 jq -e '.listen=="0.0.0.0:444" and .outbounds[0].direct.mode=="64"' "$work/_v6-hy.example.com.json" >/dev/null
 export_client "$work" "$work/new" "$work/_v6-hy.example.com.json"
-jq -e '(.proxies|map(.name))==["hy.example.com","hy.example.com (IPv6)"] and .proxies[1].port==444' "$work/clash.yaml" >/dev/null
-grep -Eq '@hy.example.com:444/.*obfs-password=b%20%26%3F%3D#hy.example.com%20(%28|\()IPv6(%29|\))$' "$work/hy2.txt"
+jq -e '(.proxies|map(.name))==["◇-日本-hy","◇-日本-hy (IPv6)"] and .proxies[1].port==444' "$work/clash.yaml" >/dev/null
+grep -Eq '@hy.example.com:444/.*obfs-password=b%20%26%3F%3D#%E2%97%87-%E6%97%A5%E6%9C%AC-hy%20(%28|\()IPv6(%29|\))$' "$work/hy2.txt"
 (
   ip() { return 1; }
   [[ $(ipv6_egress) == no-route ]]
@@ -70,8 +78,15 @@ jq -e '.listen=="192.0.2.2:443" and .acme.listenHost=="192.0.2.2" and .outbounds
   and .outbounds[0].direct.mode=="4" and (.outbounds[0].direct|has("bindDevice")|not)' "$work/b-ip" >/dev/null
 node_config "$work/new" "$work/a-ip" 192.0.2.1
 export_client "$work" "$work/a-ip" "$work/b-ip"
-jq -e '(.proxies|map(.name))==["hy.example.com","hy-b.example.com"] and (.proxies|map(.port))==[63992,443]
-  and .["proxy-groups"][0].proxies==["hy.example.com","hy-b.example.com","DIRECT"] and all(.proxies[];.["ip-version"]=="ipv4")' "$work/clash.yaml" >/dev/null
+jq -e '(.proxies|map(.name))==["◇-日本-hy","◇-德国-hy-b"] and (.proxies|map(.port))==[63992,443]
+  and .["proxy-groups"][0].proxies==["◇-日本-hy","◇-德国-hy-b","DIRECT"] and all(.proxies[];.["ip-version"]=="ipv4")' "$work/clash.yaml" >/dev/null
+(
+  curl() { echo '{"success":false}'; }
+  jq '.acme.domains=["hy.other.example"]' "$work/b-ip" > "$work/duplicate"
+  export_client "$work" "$work/a-ip" "$work/duplicate"
+  jq -e '(.proxies|map(.name))==["◇-未知地区-hy","◇-未知地区-hy~2"] and .proxies[1].server=="hy.other.example"' "$work/clash.yaml" >/dev/null
+)
+export_client "$work" "$work/a-ip" "$work/b-ip"
 [[ $(grep -c '^hysteria2://' "$work/hy2.txt") == 2 ]] && grep -q '@hy-b.example.com:443/' "$work/hy2.txt"
 (
   ip() { printf '%s\n' '[{"addr_info":[{"scope":"global","family":"inet","local":"192.0.2.1"},{"scope":"global","family":"inet","local":"192.0.2.2"}]}]'; }
@@ -246,7 +261,7 @@ for ((i=0;i<30;i++)); do
  if [[ -n $(ss -Hltn 'sport = :21081') ]]; then break; fi
  sleep .2
 done
-curl -fsS --max-time 30 --proxy socks5h://127.0.0.1:21081 https://www.gstatic.com/generate_204 >/dev/null
+curl -kfSs --max-time 30 --noproxy '' --proxy socks5h://127.0.0.1:21081 https://v4.hy2.test:21444/ >/dev/null
 kill "$client_pid"; wait "$client_pid" || true; client_pid=''
 printf 'PASS three IPv4 nodes: separate listeners, bound egress, exports and real QUIC through an extra node\n'
 

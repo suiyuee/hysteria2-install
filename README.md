@@ -13,6 +13,8 @@ curl -fsSL https://raw.githubusercontent.com/suiyuee/hysteria2-install/main/hyst
 
 将命令中的域名换成自己的。DNS 未就绪时每 5 秒重试，生效后自动继续；可用 Ctrl+C 取消，或加 `--dns-wait 180` 限时等待。默认最新官方核心、随机密码、内置“松间”网页。每个域名都导出 IPv4 节点（默认 UDP 443）。脚本检查公网 IPv6 路由，并通过 IPv6 直连 Cloudflare 或 Google 的 HTTPS 服务。任一探测成功，才为每个域名额外导出 IPv6 优先节点。没有公网 IPv6 路由时只部署 IPv4；有路由但 HTTPS 探测失败时，只保留所选域名已有的 IPv6 节点。带 `(IPv6)` 的节点优先走 IPv6（默认 UDP 444），目标域名只有 A 记录时自动走 IPv4。服务器需要能通过 IPv6 出网，客户端只需能通过 IPv4 连服务器。IPv6 优先按目标域名解析结果选路，已有 AAAA 但 IPv6 线路故障时不会重试 IPv4。客户端直接提交 IP 时按该 IP 连接。证书邮箱默认不填。
 
+节点显示名示例为 `◇-日本-hy3`，IPv6 优先节点会附加 ` (IPv6)`。地区由 ipwho.is 按 IPv4 出口识别，查询失败时显示“未知地区”。最后一段取域名的第一段。导入客户端后，把开头的 `◇` 改成服务商名称即可。
+
 完成后导入 `/etc/hysteria/client/clash.yaml`，或复制 `/etc/hysteria/client/hy2.txt` 中的链接。
 
 ### 一台服务器多个 IPv4
