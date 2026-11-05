@@ -88,8 +88,8 @@ jq -e '(.proxies|map(.name))==["hy.example.com","hy-b.example.com"] and (.proxie
   if port_held_by_hysteria 443; then echo 'treated foreign listener as hysteria'; exit 1; fi
 )
 if (( BASH_VERSINFO[0] >= 4 )); then
-  bash -s -- --domain hy.suiyuee.top --dry-run < hysteria.sh > "$work/pipe-domain"
-  grep -Fq 'hy.suiyuee.top' "$work/pipe-domain"
+  bash -s -- --domain hy.example.com --dry-run < hysteria.sh > "$work/pipe-domain"
+  grep -Fq 'hy.example.com' "$work/pipe-domain"
   normalize_domains 'HY.example.com.' 'hy-b.example.com, hy-c.example.com'
   [[ "${domains[*]}" == 'hy.example.com hy-b.example.com hy-c.example.com' ]]
   if (normalize_domains a.example.com A.example.com) >/dev/null 2>&1; then echo 'accepted duplicate domain'; exit 1; fi
