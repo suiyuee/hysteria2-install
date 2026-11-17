@@ -15,7 +15,7 @@ fail() { printf '部署未完成：%s\n' "$*" >&2; exit 1; }
 usage() {
   cat <<'HELP'
 用法：bash hysteria.sh [install|upgrade|reconfigure] [参数]
-Debian 13.x / systemd，IPv4 接入，自动检测 IPv6 出口。默认安装，已有配置时改为重新配置。
+Debian 13.x / systemd，IPv4 接入，外部连通性检测默认关闭。默认安装，已有配置时改为重新配置。
 多个域名即多个 IPv4 节点；重新配置时不在列表里的附加节点会被停用并删除配置。
   --domain 域名          直接解析到本机；可重复或用逗号分隔。多个域名时
                          每个域名的 A 记录指向本机一个不同的 IPv4，
@@ -29,6 +29,7 @@ Debian 13.x / systemd，IPv4 接入，自动检测 IPv6 出口。默认安装，
   --dns-wait 秒数|forever 默认一直等待 DNS，每 5 秒检查一次
   --non-interactive      不提问
   --dry-run              只检查输入和计划，不改系统（需要已有 jq）
+  --check-connectivity   启用外部 IPv6 连通性及多 IPv4 出口检测（默认关闭）
   --help                 显示帮助
 HELP
 }
@@ -77,6 +78,7 @@ node_config() {
     .outbounds |= map(if .type == "direct" then .direct.bindIPv4 = $ip | del(.direct.bindDevice) else . end)' "$src" > "$output"
 }
 
+# 仅显式启用时对外探测；默认只检查本机路由，不据此新增 IPv6 节点。
 # A verified TLS response proves direct IPv6 reachability, regardless of HTTP status.
 ipv6_egress() {
   local endpoint host addr state=no-route
@@ -84,6 +86,7 @@ ipv6_egress() {
     read -r host addr <<< "$endpoint"
     ip -6 route get "$addr" >/dev/null 2>&1 || continue
     state=unconfirmed
+    [[ ${1:-false} == true ]] || continue
     if curl -q --ipv6 --noproxy '*' --resolve "$host:443:[$addr]" --silent \
         --output /dev/null --connect-timeout 3 --max-time 5 "https://$host/"; then
       printf 'available\n'; return
@@ -100,23 +103,14 @@ prepare_v6_config() {
   ' "$1" > "$2"
 }
 
-node_country() {
-  local ip=$1
-  curl -q --ipv4 --noproxy '*' --fail --silent --connect-timeout 2 --max-time 5 \
-    "https://ipwho.is/$ip?lang=zh-CN&fields=success,country" |
-    jq -er 'select(.success == true) | .country | strings | select(length > 0 and length <= 80 and (test("[[:cntrl:]]") | not))'
-}
-
 export_client() {
-  local dest=$1 config domain ip country base name n names='{}'
+  local dest=$1 config domain base name n names='{}'
   local -a used=()
   shift
   for config in "$@"; do
     [[ ${config##*/} != _v6-* ]] || continue
     domain=$(jq -r '.acme.domains[0]' "$config")
-    ip=$(jq -r '[.outbounds[] | select(.type=="direct")][0].direct.bindIPv4 // ""' "$config")
-    country=$(node_country "$ip") || country='未知地区'
-    base="◇-$country-${domain%%.*}"
+    base="◇-${domain%%.*}"
     name=$base
     n=1
     while (( ${#used[@]} )) && contains "$name" "${used[@]}"; do n=$((n + 1)); name="$base~$n"; done
@@ -185,6 +179,10 @@ dns_check() {
 # 用该 IP 发起一次外网请求，确认出口就是它自己；附加 IP 走了别的出口时需要先配置策略路由。
 egress_check() {
   local ip=$1 seen
+  if [[ ${2:-false} != true ]]; then
+    printf '%s：未执行外部出口检测，请自行确认出网 IP。\n' "$ip"
+    return
+  fi
   seen=$(fetch --interface "$ip" https://1.1.1.1/cdn-cgi/trace | sed -n 's/^ip=//p') || seen=''
   [[ $seen == "$ip" ]] || fail "从 $ip 出网时对外显示为 ${seen:-（请求失败）}。请确认该 IP 已配置在网卡上，必要时为它配置策略路由。"
 }
@@ -304,7 +302,7 @@ normalize_domains() {
 
 main() {
   local action=install email='' port='' url='' version='' builtin=false noninteractive=false dry=false dns_wait=forever
-  local v6_port='' old_v6_port='' v6_state src
+  local v6_port='' old_v6_port='' v6_state src check_connectivity=false
   local -a v6_domains=() ports=()
   local arg old old_port current_domain missing=() p os_id os_version name ip multi=false
   local -a given=() domains=() old_nodes=() extras=() removed=() node_ips=() configs=()
@@ -314,6 +312,7 @@ main() {
     arg=$1; shift
     case $arg in
       --help|-h) usage; return;;
+      --check-connectivity) check_connectivity=true;;
       --non-interactive) noninteractive=true;; --dry-run) dry=true;; --builtin-site) builtin=true;;
       --domain|--email|--port|--v6-port|--masquerade-url|--version|--dns-wait)
         if (( $# == 0 )) || [[ -z $1 || $1 == --* ]]; then fail "$arg 缺少值。"; fi
@@ -381,10 +380,10 @@ main() {
     (( ${#domains[@]} )) || fail '需要正确的连接域名。'
     extras=("${domains[@]:1}")
     (( ${#extras[@]} == 0 )) || multi=true
-    if command -v ip >/dev/null; then v6_state=$(ipv6_egress); else v6_state=unconfirmed; fi
+    if command -v ip >/dev/null; then v6_state=$(ipv6_egress "$check_connectivity"); else v6_state=unconfirmed; fi
     case $v6_state in
       no-route) printf '没有公网 IPv6 路由，仅配置 IPv4 节点。\n';;
-      unconfirmed) printf '未确认 IPv6 出口，仅保留所选域名已有的 IPv6 节点。\n';;
+      unconfirmed) printf '未确认 IPv6 出口，仅保留所选域名已有的 IPv6 节点；可用 --check-connectivity 启用外部检测。\n';;
     esac
     for name in "${domains[@]}"; do
       if [[ $v6_state == available ]] || { [[ $v6_state == unconfirmed ]] && contains "_v6-$name" "${old_nodes[@]}"; }; then
@@ -443,8 +442,8 @@ main() {
         ip=$(dns_check "$name" "$dns_wait" true)
         ! contains "$ip" "${node_ips[@]}" || fail "多个域名解析到同一个 IP：$ip。每个节点需要不同的 IPv4。"
         node_ips+=("$ip")
-        egress_check "$ip"
-        printf '%s → %s，出口确认\n' "$name" "$ip"
+        egress_check "$ip" "$check_connectivity"
+        printf '%s → %s，绑定本机 IPv4\n' "$name" "$ip"
       done
       node_config "$work/config.json" "$work/config.ip" "${node_ips[0]}"
       mv "$work/config.ip" "$work/config.json"

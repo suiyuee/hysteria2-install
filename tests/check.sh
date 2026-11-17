@@ -31,31 +31,28 @@ prepare_config "$work/old" "$work/new" hy.example.com '' 63992 '' false
 for key in auth quic obfs acme masquerade; do
  [[ $(jq -c ".$key" "$work/old") == "$(jq -c ".$key" "$work/new")" ]]
 done
-# Simulate IP geolocation independently of the test machine's public address.
-curl() {
-  case "${!#}" in
-    'https://ipwho.is/192.0.2.2?'*) echo '{"success":true,"country":"德国"}';;
-    'https://ipwho.is/'*) echo '{"success":true,"country":"日本"}';;
-    *) return 1;;
-  esac
-}
+# Exporting names must not contact a geolocation service.
+curl() { touch "$work/unexpected-curl"; return 1; }
 export_client "$work" "$work/new"
 jq -e --slurpfile old "$work/old" '.proxies[0].password==$old[0].auth.password and .proxies[0]["skip-cert-verify"]==false and .proxies[0]["obfs-password"]==$old[0].obfs.salamander.password' "$work/clash.yaml" >/dev/null
 grep -Fq 'obfs-password=b%20%26%3F%3D' "$work/hy2.txt"
-jq -e '.ipv6==false and .dns.ipv6==false and .proxies[0]["ip-version"]=="ipv4" and .proxies[0].name=="◇-日本-hy"' "$work/clash.yaml" >/dev/null
+jq -e '.ipv6==false and .dns.ipv6==false and .proxies[0]["ip-version"]=="ipv4" and .proxies[0].name=="◇-hy"' "$work/clash.yaml" >/dev/null
 prepare_v6_config "$work/new" "$work/_v6-hy.example.com.json" 444
 jq -e '.listen=="0.0.0.0:444" and .outbounds[0].direct.mode=="64"' "$work/_v6-hy.example.com.json" >/dev/null
 export_client "$work" "$work/new" "$work/_v6-hy.example.com.json"
-jq -e '(.proxies|map(.name))==["◇-日本-hy","◇-日本-hy (IPv6)"] and .proxies[1].port==444' "$work/clash.yaml" >/dev/null
-grep -Eq '@hy.example.com:444/.*obfs-password=b%20%26%3F%3D#%E2%97%87-%E6%97%A5%E6%9C%AC-hy%20(%28|\()IPv6(%29|\))$' "$work/hy2.txt"
+jq -e '(.proxies|map(.name))==["◇-hy","◇-hy (IPv6)"] and .proxies[1].port==444' "$work/clash.yaml" >/dev/null
+grep -Eq '@hy.example.com:444/.*obfs-password=b%20%26%3F%3D#%E2%97%87-hy%20(%28|\()IPv6(%29|\))$' "$work/hy2.txt"
 (
   ip() { return 1; }
   [[ $(ipv6_egress) == no-route ]]
   ip() { return 0; }
   curl() { return 1; }
-  [[ $(ipv6_egress) == unconfirmed ]]
+  [[ $(ipv6_egress true) == unconfirmed ]]
   curl() { [[ $* == *"--ipv6 --noproxy *"* && ${!#} == https://dns.google/ ]]; }
-  [[ $(ipv6_egress) == available ]]
+  [[ $(ipv6_egress true) == available ]]
+  curl() { touch "$work/unexpected-curl"; return 1; }
+  [[ $(ipv6_egress) == unconfirmed ]]
+  [[ ! -e $work/unexpected-curl ]]
 )
 # DNS must point only to local IPv4, including on a dual-stack host.
 (
@@ -78,15 +75,15 @@ jq -e '.listen=="192.0.2.2:443" and .acme.listenHost=="192.0.2.2" and .outbounds
   and .outbounds[0].direct.mode=="4" and (.outbounds[0].direct|has("bindDevice")|not)' "$work/b-ip" >/dev/null
 node_config "$work/new" "$work/a-ip" 192.0.2.1
 export_client "$work" "$work/a-ip" "$work/b-ip"
-jq -e '(.proxies|map(.name))==["◇-日本-hy","◇-德国-hy-b"] and (.proxies|map(.port))==[63992,443]
-  and .["proxy-groups"][0].proxies==["◇-日本-hy","◇-德国-hy-b","DIRECT"] and all(.proxies[];.["ip-version"]=="ipv4")' "$work/clash.yaml" >/dev/null
+jq -e '(.proxies|map(.name))==["◇-hy","◇-hy-b"] and (.proxies|map(.port))==[63992,443]
+  and .["proxy-groups"][0].proxies==["◇-hy","◇-hy-b","DIRECT"] and all(.proxies[];.["ip-version"]=="ipv4")' "$work/clash.yaml" >/dev/null
 (
-  curl() { echo '{"success":false}'; }
   jq '.acme.domains=["hy.other.example"]' "$work/b-ip" > "$work/duplicate"
   export_client "$work" "$work/a-ip" "$work/duplicate"
-  jq -e '(.proxies|map(.name))==["◇-未知地区-hy","◇-未知地区-hy~2"] and .proxies[1].server=="hy.other.example"' "$work/clash.yaml" >/dev/null
+  jq -e '(.proxies|map(.name))==["◇-hy","◇-hy~2"] and .proxies[1].server=="hy.other.example"' "$work/clash.yaml" >/dev/null
 )
 export_client "$work" "$work/a-ip" "$work/b-ip"
+[[ ! -e $work/unexpected-curl ]]
 [[ $(grep -c '^hysteria2://' "$work/hy2.txt") == 2 ]] && grep -q '@hy-b.example.com:443/' "$work/hy2.txt"
 (
   ip() { printf '%s\n' '[{"addr_info":[{"scope":"global","family":"inet","local":"192.0.2.1"},{"scope":"global","family":"inet","local":"192.0.2.2"}]}]'; }
@@ -95,14 +92,26 @@ export_client "$work" "$work/a-ip" "$work/b-ip"
   getent() { printf '192.0.2.1 STREAM\n192.0.2.2 STREAM\n'; }
   if (dns_check hy-b.example.com 0 true) >/dev/null 2>&1; then echo 'accepted two A records for one node'; exit 1; fi
   fetch() { printf 'fl=1\nip=192.0.2.2\nts=1\n'; }
+  egress_check 192.0.2.2 true
+  fetch() { touch "$work/unexpected-fetch"; return 1; }
   egress_check 192.0.2.2
-  if (egress_check 192.0.2.1) >/dev/null 2>&1; then echo 'accepted wrong egress IP'; exit 1; fi
+  [[ ! -e $work/unexpected-fetch ]]
+  fetch() { printf 'fl=1\nip=192.0.2.2\nts=1\n'; }
+  if (egress_check 192.0.2.1 true) >/dev/null 2>&1; then echo 'accepted wrong egress IP'; exit 1; fi
   ss() { printf 'UNCONN 0 0 192.0.2.1:443 0.0.0.0:* users:(("hysteria",pid=7,fd=3))\n'; }
   port_held_by_hysteria 443
   ss() { printf 'UNCONN 0 0 0.0.0.0:443 0.0.0.0:* users:(("other",pid=8,fd=3))\n'; }
   if port_held_by_hysteria 443; then echo 'treated foreign listener as hysteria'; exit 1; fi
 )
 if (( BASH_VERSINFO[0] >= 4 )); then
+  (
+    ip() { return 0; }
+    ipv6_egress() { printf '%s' "$1" > "$work/check-enabled"; echo unconfirmed; }
+    main --domain hy.example.com --dry-run > /dev/null
+    [[ $(cat "$work/check-enabled") == false ]]
+    main --domain hy.example.com --check-connectivity --dry-run > /dev/null
+    [[ $(cat "$work/check-enabled") == true ]]
+  )
   bash -s -- --domain hy.example.com --dry-run < hysteria.sh > "$work/pipe-domain"
   grep -Fq 'hy.example.com' "$work/pipe-domain"
   normalize_domains 'HY.example.com.' 'hy-b.example.com, hy-c.example.com'
