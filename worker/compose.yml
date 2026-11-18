@@ -1,0 +1,17 @@
+services:
+  hy2-worker:
+    build:
+      context: ..
+      dockerfile: worker/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:17861:8080"
+    volumes:
+      - hy2-data:/data
+    environment:
+      VAULT_KEY: ${VAULT_KEY:?required}
+      SERVER_ADMIN_TOKEN: ${SERVER_ADMIN_TOKEN:?required}
+      SUBSCRIPTION_ORIGIN: ${SUBSCRIPTION_ORIGIN:?required}
+      NODE_API_TOKEN: ${NODE_API_TOKEN:?required}
+volumes:
+  hy2-data:

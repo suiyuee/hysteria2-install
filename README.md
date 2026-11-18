@@ -29,3 +29,5 @@ journalctl -u hysteria-server -n 60 --no-pager
 ```
 
 核心：[Hysteria](https://github.com/HyNetworks/hysteria) · 原项目：[flame1ce/hysteria2-install](https://github.com/flame1ce/hysteria2-install)
+
+后台部署和订阅同步见 [服务器管理](worker/README.md)。

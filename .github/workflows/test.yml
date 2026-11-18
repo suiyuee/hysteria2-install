@@ -15,3 +15,12 @@ jobs:
       - run: bash -n hysteria.sh tests/check.sh
       - name: Debian 13 without Python
         run: bash tests/check.sh --container
+  worker:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: pip install -r worker/requirements.txt
+      - run: cd worker && python -m unittest discover -v

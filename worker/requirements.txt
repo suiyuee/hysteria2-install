@@ -1,0 +1,4 @@
+Flask>=3.1,<4
+paramiko>=4,<6
+cryptography>=46,<50
+gunicorn>=23,<27
